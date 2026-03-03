@@ -38,11 +38,13 @@ SHORT_TITLE_WORDS = 2
 MAX_NAME_LENGTH = 50
 
 DEFAULT_INDEX = """\
-# Paper Library
+# Folio Library
 
 ## Uncategorized
 
 <!-- New papers will be added here. Move them to your categories below. -->
+
+---
 
 """
 
