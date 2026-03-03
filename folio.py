@@ -64,7 +64,7 @@ def _extract_bib_field(content: str, field: str) -> str:
     Handles {braced}, "quoted", and plain numeric values.
     Correctly tracks nested braces for multiline values.
     """
-    match = re.search(rf"{field}\s*=\s*", content, re.IGNORECASE)
+    match = re.search(rf"\b{field}\s*=\s*", content, re.IGNORECASE)
     if not match:
         return ""
 
