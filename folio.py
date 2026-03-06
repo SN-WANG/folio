@@ -18,9 +18,14 @@ import logging
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+try:
+    from pypinyin import lazy_pinyin, Style
+    HAS_PINYIN = True
+except ImportError:
+    HAS_PINYIN = False
 
 # ─── Paths ─────────────────────────────────────────────────────────────
 FOLIO_HOME = Path.home() / "folio"
@@ -35,6 +40,7 @@ log = logging.getLogger("folio")
 
 # ─── Naming Constants ─────────────────────────────────────────────────
 SHORT_TITLE_WORDS = 2
+SHORT_TITLE_CN_CHARS = 4
 MAX_NAME_LENGTH = 50
 
 DEFAULT_INDEX = """\
@@ -183,16 +189,39 @@ def parse_ris(filepath: Path) -> Optional[Dict[str, str]]:
 #  Name Generator
 # ═══════════════════════════════════════════════════════════════════════
 
+def _to_ascii_name(text: str) -> str:
+    """Convert text (possibly Chinese) to ASCII-safe CamelCase.
+
+    Uses pypinyin if available; otherwise keeps Chinese characters as-is.
+    """
+    if HAS_PINYIN and re.search(r"[\u4e00-\u9fff]", text):
+        parts = lazy_pinyin(text, style=Style.NORMAL)
+        return "".join(w.capitalize() for w in parts if w.strip())
+    return text
+
+
 def generate_name(metadata: Dict[str, str]) -> str:
     """Generate standardized name: AuthorYYYY_KeywordKeyword."""
-    author = re.sub(r"[^a-zA-Z]", "", metadata.get("first_author", "Unknown"))
+    author_raw = metadata.get("first_author", "Unknown")
+    author_ascii = _to_ascii_name(author_raw)
+    author = re.sub(r"[^a-zA-Z\u4e00-\u9fff]", "", author_ascii) or "Unknown"
     year = metadata.get("year", "Unknown")
 
-    title = metadata.get("title", "Untitled")
-    words = re.findall(r"[a-zA-Z]+", title)
+    title_raw = metadata.get("title", "Untitled")
+    if re.search(r"[\u4e00-\u9fff]", title_raw):
+        cn_chars = re.findall(r"[\u4e00-\u9fff]", title_raw)
+        title_for_name = "".join(cn_chars[:SHORT_TITLE_CN_CHARS])
+    else:
+        title_for_name = title_raw
+    title_ascii = _to_ascii_name(title_for_name)
+    words = re.findall(r"[a-zA-Z]+", title_ascii)
     keywords = [w.capitalize() for w in words if w.lower() not in STOP_WORDS]
 
-    short_title = "".join(keywords[:SHORT_TITLE_WORDS]) if keywords else "Untitled"
+    if not keywords:
+        cn_chars = re.findall(r"[\u4e00-\u9fff]+", title_raw)
+        short_title = "".join(cn_chars)[:6] if cn_chars else "Untitled"
+    else:
+        short_title = "".join(keywords[:SHORT_TITLE_WORDS])
 
     name = f"{author}{year}_{short_title}"
     return name[:MAX_NAME_LENGTH]
