@@ -11,6 +11,7 @@ Usage:
     folio --dry-run    Preview without moving files
     folio --rebuild    Rebuild library.bib only
     folio --init       Initialize directory structure only
+    folio --url URL    Download paper from ArXiv URL into inbox
 """
 
 import argparse
@@ -18,6 +19,9 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -34,9 +38,50 @@ LIBRARY_DIR = FOLIO_HOME / "library"
 INDEX_FILE = FOLIO_HOME / "index.md"
 LIBRARY_BIB = FOLIO_HOME / "library.bib"
 
-# ─── Logging ───────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="[folio] %(message)s")
-log = logging.getLogger("folio")
+
+# ─── ANSI Colors ──────────────────────────────────────────────────────
+class Hue:
+    """ANSI escape codes for colored terminal output."""
+    b = "\033[1;34m"    # bold blue     — key names, paper names
+    c = "\033[1;36m"    # bold cyan     — file paths, secondary info
+    m = "\033[1;35m"    # bold magenta  — values, counts
+    y = "\033[1;33m"    # bold yellow   — warnings, dry-run
+    g = "\033[1;32m"    # bold green    — success
+    r = "\033[1;31m"    # bold red      — errors
+    d = "\033[90m"      # dim gray      — decorative lines
+    q = "\033[0m"       # reset
+
+hue = Hue()
+
+
+# ─── Logging ──────────────────────────────────────────────────────────
+class _FolioFormatter(logging.Formatter):
+    """Custom formatter with colored [folio] prefix per log level."""
+    _COLORS = {
+        logging.INFO:     hue.b,
+        logging.WARNING:  hue.y,
+        logging.ERROR:    hue.r,
+        logging.CRITICAL: hue.r,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self._COLORS.get(record.levelno, hue.q)
+        return f"{color}[folio]{hue.q} {record.getMessage()}"
+
+
+def _setup_logger() -> logging.Logger:
+    """Create a colored console logger for folio."""
+    logger = logging.getLogger("folio")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_FolioFormatter())
+    logger.addHandler(handler)
+    return logger
+
+log = _setup_logger()
 
 # ─── Naming Constants ─────────────────────────────────────────────────
 SHORT_TITLE_WORDS = 2
@@ -255,10 +300,10 @@ def try_clipboard_bib(inbox: Path) -> None:
     if len(unpaired) == 1:
         bib_path = inbox / f"{unpaired[0].stem}.bib"
         bib_path.write_text(clip, encoding="utf-8")
-        log.info(f"Clipboard BibTeX → {bib_path.name}")
+        log.info(f"Clipboard BibTeX -> {hue.c}{bib_path.name}{hue.q}")
     else:
         log.warning(
-            f"{len(unpaired)} PDFs in inbox but only one clipboard — "
+            f"{hue.m}{len(unpaired)}{hue.q} PDFs in inbox but only one clipboard — "
             "paste applies to most recent PDF only. Skipping."
         )
 
@@ -301,12 +346,12 @@ def find_pairs(inbox: Path) -> List[Tuple[Path, Path]]:
         pdf = next(iter(upm.values()))
         ref = next(iter(urm.values()))
         pairs.append((pdf, ref))
-        log.info(f"Auto-paired: {pdf.name} <-> {ref.name}")
+        log.info(f"Auto-paired: {hue.c}{pdf.name}{hue.q} <-> {hue.c}{ref.name}{hue.q}")
     else:
         for s, p in upm.items():
-            log.warning(f"No matching bib/ris for: {p.name}")
+            log.warning(f"No matching bib/ris for: {hue.y}{p.name}{hue.q}")
         for s, r in urm.items():
-            log.warning(f"No matching PDF for: {r.name}")
+            log.warning(f"No matching PDF for: {hue.y}{r.name}{hue.q}")
 
     return pairs
 
@@ -347,7 +392,9 @@ def add_to_uncategorized(
             break
 
     if insert_idx is None:
-        log.error("No '## Uncategorized' section in index.md — skipping update.")
+        log.error(
+            f"No {hue.r}## Uncategorized{hue.q} section in index.md — skipping update."
+        )
         return
 
     new_lines: List[str] = []
@@ -409,6 +456,98 @@ def rebuild_library_bib(library_dir: Path, output: Path) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  ArXiv Downloader
+# ═══════════════════════════════════════════════════════════════════════
+
+def _arxiv_xml_to_bib(xml_data: str, arxiv_id: str) -> str:
+    """Convert ArXiv API XML response to a BibTeX entry string."""
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    root = ET.fromstring(xml_data)
+    entry = root.find("atom:entry", ns)
+    if entry is None:
+        return ""
+
+    title = entry.findtext("atom:title", "", ns).strip().replace("\n", " ")
+    title = re.sub(r"\s+", " ", title)
+
+    authors = [
+        a.findtext("atom:name", "", ns)
+        for a in entry.findall("atom:author", ns)
+    ]
+    authors_bib = " and ".join(authors)
+
+    published = entry.findtext("atom:published", "", ns)
+    year = published[:4] if published else "Unknown"
+
+    first_last = authors[0].split()[-1] if authors else "Unknown"
+    cite_key = re.sub(r"[^a-zA-Z]", "", first_last) + year
+
+    return (
+        f"@article{{{cite_key},\n"
+        f"  author = {{{authors_bib}}},\n"
+        f"  title = {{{title}}},\n"
+        f"  year = {{{year}}},\n"
+        f"  journal = {{arXiv preprint arXiv:{arxiv_id}}},\n"
+        f"  eprint = {{{arxiv_id}}},\n"
+        f"  archivePrefix = {{arXiv}},\n"
+        f"}}\n"
+    )
+
+
+def fetch_arxiv(url: str, inbox: Path) -> bool:
+    """Download PDF and BibTeX from an ArXiv URL into the inbox.
+
+    Parses the arXiv ID from the URL, downloads the PDF, queries the
+    ArXiv API for metadata, and writes a .bib file — both into inbox/.
+
+    Args:
+        url: ArXiv abstract URL (e.g. https://arxiv.org/abs/1706.03762).
+        inbox: Path to the inbox directory.
+
+    Returns:
+        True if download succeeded, False otherwise.
+    """
+    match = re.search(r"arxiv\.org/abs/([^\s/?#]+)", url)
+    if not match:
+        log.error(f"Cannot parse arXiv ID from: {hue.r}{url}{hue.q}")
+        return False
+
+    arxiv_id = match.group(1)
+    safe_stem = arxiv_id.replace("/", "_")
+    log.info(f"Fetching arXiv: {hue.m}{arxiv_id}{hue.q}")
+
+    # Download PDF
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    pdf_path = inbox / f"{safe_stem}.pdf"
+    try:
+        urllib.request.urlretrieve(pdf_url, str(pdf_path))
+        log.info(f"  PDF  -> {hue.c}{pdf_path.name}{hue.q}")
+    except Exception as e:
+        log.error(f"Failed to download PDF: {hue.r}{e}{hue.q}")
+        return False
+
+    # Fetch metadata from ArXiv API and build BibTeX
+    api_url = f"http://export.arxiv.org/api/query?id_list={arxiv_id}"
+    try:
+        with urllib.request.urlopen(api_url, timeout=15) as resp:
+            xml_data = resp.read().decode("utf-8")
+    except Exception as e:
+        log.error(f"Failed to fetch metadata: {hue.r}{e}{hue.q}")
+        return False
+
+    bib_content = _arxiv_xml_to_bib(xml_data, arxiv_id)
+    if bib_content:
+        bib_path = inbox / f"{safe_stem}.bib"
+        bib_path.write_text(bib_content, encoding="utf-8")
+        log.info(f"  BIB  -> {hue.c}{bib_path.name}{hue.q}")
+    else:
+        log.warning("Could not extract BibTeX from API response")
+
+    log.info(f"{hue.g}ArXiv download complete.{hue.q}")
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Initialization
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -433,7 +572,7 @@ def init_folio() -> None:
 
     if not INDEX_FILE.exists():
         INDEX_FILE.write_text(DEFAULT_INDEX, encoding="utf-8")
-        log.info(f"Created: {INDEX_FILE}")
+        log.info(f"Created: {hue.c}{INDEX_FILE}{hue.q}")
 
     if not LIBRARY_BIB.exists():
         LIBRARY_BIB.write_text("", encoding="utf-8")
@@ -460,24 +599,27 @@ def process_inbox(dry_run: bool = False) -> List[Dict[str, str]]:
         metadata = parse_bib(ref_path) if suffix == ".bib" else parse_ris(ref_path)
 
         if metadata is None:
-            log.warning(f"Failed to parse: {ref_path.name}")
+            log.warning(f"Failed to parse: {hue.y}{ref_path.name}{hue.q}")
             continue
 
         name = generate_name(metadata)
 
         if name in indexed:
-            log.info(f"Already indexed, skipping: {name}")
+            log.info(f"Already indexed, skipping: {hue.c}{name}{hue.q}")
             continue
 
         target_dir, final_name = ensure_unique_path(LIBRARY_DIR, name)
 
         if dry_run:
-            log.info(f"[DRY RUN] {pdf_path.name} + {ref_path.name} -> {final_name}/")
+            log.info(
+                f"{hue.y}[DRY RUN]{hue.q} {hue.c}{pdf_path.name}{hue.q} + "
+                f"{hue.c}{ref_path.name}{hue.q} -> {hue.b}{final_name}/{hue.q}"
+            )
         else:
             target_dir.mkdir(parents=True)
             shutil.move(str(pdf_path), str(target_dir / f"{final_name}.pdf"))
             shutil.move(str(ref_path), str(target_dir / f"{final_name}{suffix}"))
-            log.info(f"Processed: {final_name}")
+            log.info(f"{hue.g}Processed:{hue.q} {hue.b}{final_name}{hue.q}")
 
         new_entries.append({
             "name": final_name,
@@ -513,41 +655,53 @@ def main() -> None:
         "--init", action="store_true",
         help="Initialize directory structure and exit",
     )
+    parser.add_argument(
+        "--url", type=str, metavar="URL",
+        help="ArXiv URL to download (PDF + BibTeX -> inbox, then process)",
+    )
     args = parser.parse_args()
 
     init_folio()
 
     if args.init:
-        log.info(f"Folio initialized at {FOLIO_HOME}")
+        log.info(f"Folio initialized at {hue.c}{FOLIO_HOME}{hue.q}")
         return
 
     if args.rebuild:
         count = rebuild_library_bib(LIBRARY_DIR, LIBRARY_BIB)
-        log.info(f"library.bib rebuilt ({count} entries)")
+        log.info(f"library.bib rebuilt ({hue.m}{count}{hue.q} entries)")
         return
 
-    log.info("Processing inbox...")
+    # ArXiv download: fetch into inbox first, then fall through to process
+    if args.url:
+        if not fetch_arxiv(args.url, INBOX_DIR):
+            return
+
+    log.info(f"{hue.c}Processing inbox...{hue.q}")
     new_entries = process_inbox(dry_run=args.dry_run)
 
     if new_entries and not args.dry_run:
         add_to_uncategorized(INDEX_FILE, new_entries)
-        log.info(f"Added {len(new_entries)} paper(s) to Uncategorized.")
+        log.info(
+            f"{hue.g}Added {hue.m}{len(new_entries)}{hue.g} paper(s) "
+            f"to Uncategorized.{hue.q}"
+        )
 
         count = rebuild_library_bib(LIBRARY_DIR, LIBRARY_BIB)
-        log.info(f"library.bib updated ({count} entries total)")
+        log.info(f"library.bib updated ({hue.m}{count}{hue.q} entries total)")
 
-        log.info("─" * 40)
+        log.info(f"{hue.d}{'─' * 40}{hue.q}")
         for e in new_entries:
-            log.info(f"  + {e['name']}")
-        log.info("─" * 40)
+            log.info(f"  {hue.g}+{hue.q} {hue.b}{e['name']}{hue.q}")
+        log.info(f"{hue.d}{'─' * 40}{hue.q}")
         log.info(
-            'Move new entries from "Uncategorized" in index.md '
-            'to your preferred categories.'
+            f"Move new entries from {hue.m}Uncategorized{hue.q} in index.md "
+            f"to your preferred categories."
         )
     elif not new_entries:
         log.info("No new papers to process.")
     else:
-        log.info("[DRY RUN] No files were moved.")
+        log.info(f"{hue.y}[DRY RUN]{hue.q} No files were moved.")
 
 
 if __name__ == "__main__":

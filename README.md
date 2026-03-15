@@ -38,6 +38,18 @@ For sources like arXiv that don't offer a `.bib` download button, you can copy t
 
 This only triggers when the inbox has **exactly one** unpaired PDF and **zero** ref files. If multiple lone PDFs are present, Folio warns and skips (ambiguous which PDF the clipboard belongs to). macOS only (`pbpaste`).
 
+### ArXiv URL Import
+
+Import a paper directly from ArXiv in one command:
+
+```bash
+folio --url https://arxiv.org/abs/1706.03762
+```
+
+Folio parses the arXiv ID from the URL, downloads the PDF, fetches metadata from the ArXiv API, generates a `.bib` file, and then auto-processes the paper into your library — no manual download or clipboard step needed.
+
+Supported URL format: `https://arxiv.org/abs/XXXX.XXXXX`
+
 ## 🚀 Usage
 
 ```bash
@@ -52,6 +64,9 @@ folio --rebuild
 
 # Initialize directory structure only
 folio --init
+
+# Import from ArXiv URL
+folio --url https://arxiv.org/abs/1706.03762
 ```
 
 ## ⚙️ Installation
